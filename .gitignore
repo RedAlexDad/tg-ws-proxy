@@ -25,3 +25,6 @@ Desktop.ini
 .DS_Store
 
 /icon.icns
+
+# Secret key
+.secret
