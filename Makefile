@@ -64,6 +64,9 @@ run: .secret
 		--name $(CONTAINER) \
 		--restart=always \
 		-p $(PORT):$(PORT) \
+		--dns 8.8.8.8 \
+		--dns 77.88.8.8 \
+		--dns 1.1.1.1 \
 		-e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
 		$(IMAGE):latest
 	@printf "$(GREEN)Container started on port $(PORT).$(RESET)\n"
