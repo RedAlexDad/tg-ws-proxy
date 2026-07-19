@@ -22,14 +22,11 @@ if __name__ == '__main__' and (__package__ is None or __package__ == ''):
 
 from .utils import *
 from .stats import stats
-from .config import (proxy_config, parse_dc_ip_list,
-                     start_cfproxy_domain_refresh, coerce_domain_list)
+from .config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, coerce_domain_list
 from .bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
 from .raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
 from .fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
 from .balancer import balancer
-from .pool import cf_worker_pool
-from .autorecover import autorecover
 from .pool import ws_pool, cf_worker_pool
 from ._aes import Cipher, algorithms, modes
 
@@ -39,13 +36,11 @@ log = logging.getLogger('tg-mtproto-proxy')
 IP_FAIL_COOLDOWN = 3600.0
 DC_FAIL_COOLDOWN = 60.0
 WS_FAIL_TIMEOUT = 2.0
-FRONTING_COOLDOWN = 1800.0
 LISTENER_CHECK_INTERVAL = 5.0
 LISTENER_RESTART_DELAY = 1.0
 ws_blacklist: Set[str] = set()
 dc_fail_until: Dict[str, float] = {}
 ip_fail_until: Dict[str, float] = {}
-fronting_until: float = 0.0
 
 
 def _try_handshake(handshake: bytes, secret: bytes) -> Optional[Tuple[int, bool, bytes, bytes]]:
@@ -253,8 +248,6 @@ def _build_crypto_ctx(client_dec_prekey_iv, secret, relay_init):
 
 
 async def _handle_client(reader, writer, secret: bytes):
-    global fronting_until
-    
     stats.connections_total += 1
     stats.connections_active += 1
     peer = writer.get_extra_info('peername')
@@ -339,7 +332,6 @@ async def _handle_client(reader, writer, secret: bytes):
             return
 
         ws_timeout = WS_FAIL_TIMEOUT if now < dc_fail_until.get(dc_key, 0) else 5.0
-        fronting_active = now < fronting_until
 
         domains = ws_domains(dc, is_media)
         ws = None
@@ -351,26 +343,6 @@ async def _handle_client(reader, writer, secret: bytes):
         if ws:
             log.info("[%s] DC%d%s -> pool hit via %s",
                      label, dc, media_tag, target)
-        elif fronting_active:
-            # TODO: Move fronting logic into bridge.py where other fallbacks are handled
-            log.info("[%s] DC%d%s -> fronting / Host %s",
-                     label, dc, media_tag, domains[0])
-            try:
-                ws = await RawWebSocket.connect(target, domains[0],
-                                                timeout=5.0, path=ws_path,
-                                                sni="sprinthost.ru")
-            except Exception as exc:
-                stats.ws_errors += 1
-                autorecover.record('fronting')
-                log.warning("[%s] DC%d%s fronting failed: %s",
-                            label, dc, media_tag, repr(exc))
-            if ws:
-                stats.connections_fronting += 1
-                fronting_until = now + FRONTING_COOLDOWN
-                ws_pool.fronting_until = fronting_until
-            else:
-                fronting_until = 0.0
-                ws_pool.fronting_until = 0.0
         else:
             for domain in domains:
                 url = f'wss://{domain}{ws_path}'
@@ -384,7 +356,6 @@ async def _handle_client(reader, writer, secret: bytes):
                     break
                 except WsHandshakeError as exc:
                     stats.ws_errors += 1
-                    autorecover.record('ws')
                     if exc.is_redirect:
                         ws_failed_redirect = True
                         log.warning("[%s] DC%d%s got %d from %s -> %s",
@@ -398,44 +369,22 @@ async def _handle_client(reader, writer, secret: bytes):
                                     label, dc, media_tag, exc.status_line)
                 except asyncio.TimeoutError:
                     stats.ws_errors += 1
-                    autorecover.record('ws_timeout')
                     ws_timed_out = True
                     log.warning("[%s] DC%d%s WS connect timed out via %s",
                                 label, dc, media_tag, domain)
                     break
                 except Exception as exc:
                     stats.ws_errors += 1
-                    autorecover.record('ws')
                     all_redirects = False
                     log.warning("[%s] DC%d%s WS connect failed: %s",
                                 label, dc, media_tag, repr(exc))
-
-        # Fronting fallback if WS timed out
-        # TODO: Move fronting logic into bridge.py where other fallbacks are handled
-        # and don't forget about WsPool fronting fallback
-        if ws is None and ws_timed_out and not fronting_active:
-            log.info("[%s] DC%d%s -> fronting fallback (Host %s)",
-                     label, dc, media_tag, domains[0])
-            try:
-                ws = await RawWebSocket.connect(target, domains[0],
-                                                timeout=5.0, path=ws_path,
-                                                sni="sprinthost.ru")
-            except Exception as exc:
-                stats.ws_errors += 1
-                autorecover.record('fronting')
-                log.warning("[%s] DC%d%s fronting failed: %s",
-                            label, dc, media_tag, repr(exc))
-            if ws:
-                fronting_until = now + FRONTING_COOLDOWN
-                ws_pool.fronting_until = now + FRONTING_COOLDOWN
-                stats.connections_fronting += 1
-                log.info("[%s] DC%d%s fronting OK for %ds",
-                         label, dc, media_tag, int(FRONTING_COOLDOWN))
 
         # WS failed -> fallback
         if ws is None:
             if ws_timed_out:
                 ip_fail_until[target] = now + IP_FAIL_COOLDOWN
+                log.info("[%s] DC%d%s WS connect to %s timed out, cooldown for %ds",
+                         label, dc, media_tag, target, int(IP_FAIL_COOLDOWN))
 
             if ws_failed_redirect and all_redirects:
                 ws_blacklist.add(dc_key)
@@ -510,7 +459,7 @@ _client_tasks: Set[asyncio.Task] = set()
 
 
 async def _run(stop_event: Optional[asyncio.Event] = None):
-    global _server_instance, _server_stop_event, fronting_until
+    global _server_instance, _server_stop_event
     _server_stop_event = stop_event
 
     ws_pool.reset()
@@ -519,7 +468,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     dc_fail_until.clear()
     ip_fail_until.clear()
     _client_tasks.clear()
-    fronting_until = 0.0
 
     if proxy_config.fallback_cfproxy:
         user = proxy_config.cfproxy_user_domains
@@ -527,26 +475,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             balancer.update_domains_list(user)
         else:
             start_cfproxy_domain_refresh()
-
-    async def _soft_reset():
-        """In-place recovery: clear failure state and pools, refresh domains."""
-        log.warning("autorecover: soft reset: clearing blacklist/cooldowns/pools")
-        ws_blacklist.clear()
-        dc_fail_until.clear()
-        ip_fail_until.clear()
-        ws_pool.reset()
-        cf_worker_pool.reset()
-        balancer.update_domains_list(
-            proxy_config.cfproxy_user_domains or balancer.domains)
-        if proxy_config.fallback_cfproxy and not proxy_config.cfproxy_user_domains:
-            start_cfproxy_domain_refresh()
-
-    def _hard_reset():
-        """Last resort: exit the process so the container restarts."""
-        log.error("autorecover: hard reset: exiting process for container restart")
-        os._exit(1)
-
-    autorecover.configure(_soft_reset, _hard_reset)
 
     secret_bytes = bytes.fromhex(proxy_config.secret)
 
@@ -610,7 +538,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             raise
 
     log_stats_task = asyncio.create_task(log_stats())
-    autorecover_task = asyncio.create_task(autorecover.monitor())
 
     await ws_pool.warmup()
     await cf_worker_pool.warmup()
@@ -687,7 +614,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             await log_stats_task
         except asyncio.CancelledError:
             pass
-        await _quiet_cancel(autorecover_task)
         try:
             server.close()
             await server.wait_closed()
