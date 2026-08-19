@@ -1101,13 +1101,215 @@ Recv-Q Send-Q Local Address:Port  Peer Address:Port  Process
 
 ---
 
+## 12. Инцидент 18.08.2026: «вчера работало, сегодня нет»
+
+### 12.1. Симптомы
+
+Контейнер запущен через bridge-сеть (`-p 1443:1443`, `--dns 8.8.8.8 /
+77.88.8.8 / 1.1.1.1`), но **все** соединения к Telegram уходят в
+`TimeoutError`:
+
+```
+08:11:28  WARNING  [172.17.0.1:59036] DC2 media fronting failed: TimeoutError()
+08:11:28  INFO     [172.17.0.1:59036] DC2 media -> trying CF proxy
+08:11:38  WARNING  [172.17.0.1:59036] DC2 media CF proxy failed: TimeoutError()
+```
+
+Не работали одновременно прямой DC IP, CF proxy и fronting. Типичная
+картина «сначала всё ок, потом разом отвалилось».
+
+### 12.2. Диагностика
+
+**Проблема A: провайдер режет UDP-DNS ко ВСЕМ внешним резолверам.**
+
+Проверено с хоста (минуя systemd-resolved):
+
+```bash
+$ dig @8.8.8.8   github.com A   # → пусто, ответа нет (заблокирован)
+$ dig @1.1.1.1   github.com A   # → пусто, ответа нет (заблокирован)
+$ dig @77.88.8.8 github.com A   # → пусто, ответа нет (заблокирован)
+$ dig @195.19.33.199 github.com A  # → NOERROR (работает, DNS провайдера)
+```
+
+Рабочие DNS провайдера (`resolvectl status ppp0`): `195.19.33.199`,
+`195.19.32.2`. Всё это значит, что флаги `--dns 8.8.8.8/77.88.8.8/1.1.1.1`
+из Makefile были бесполезны: контейнер не резолвил даже `github.com`
+(`socket.gaierror: [Errno -3] Temporary failure in name resolution`).
+
+**Проблема B: все CF-домены мертвы.**
+
+Проверено через DoH (`cloudflare-dns.com/dns-query`), в обход DNS-блокировки
+провайдера: ни у одного из 20 доменов (и из GitHub-списка, и встроенных в
+код) нет A-записи:
+
+```json
+{"name":"pclead.co.uk","type":1} → NO-A-RECORD (есть только NS Cloudflare)
+```
+
+**Проблема C: блокировка IP Telegram — ротационная, а не постоянная.**
+
+- В начале диагностики TCP к `149.154.167.220:443` с хоста не проходил.
+- После перезапуска в host-сети — прошёл, сессии реально качают данные.
+
+Именно это объясняет «ночью работало, днём нет»: провайдер/РКН блокирует
+подсети Telegram ротациями по времени.
+
+### 12.3. Корневая причина
+
+Fallback-механизмы прокси (fronting через `kws2.web.telegram.org` и CF
+proxy) **требуют DNS**. DNS внутри контейнера был сломан из-за жёстко
+прописанных в Makefile заблокированных публичных резолверов. Поэтому при
+очередной ротационной блокировке прямого DC IP прокси остался без единого
+рабочего пути: прямой IP закрыт, а запасные пути не могут даже резолвить
+домены.
+
+### 12.4. Решение (вариант B): `--network host`
+
+`Makefile` (цель `run`):
+
+```makefile
+# Было:
+docker run -d --name tg-ws-proxy --restart=always \
+    -p 1443:1443 \
+    --dns 8.8.8.8 --dns 77.88.8.8 --dns 1.1.1.1 \
+    -e TG_WS_PROXY_SECRET="$(shell cat .secret)" tg-ws-proxy:latest
+
+# Стало:
+docker run -d --name tg-ws-proxy --restart=always \
+    --network host \
+    -e TG_WS_PROXY_SECRET="$(shell cat .secret)" tg-ws-proxy:latest
+```
+
+Преимущества:
+
+- Контейнер использует системный резолвер (systemd-resolved, `127.0.0.53`)
+  — DNS работает при любой сети и не зависит от блокировки внешних DNS.
+- `tg://`-ссылка формируется с реальным IP хоста (не `172.17.0.2`).
+- При блокировке прямого IP fallback'ы реально могут сработать — они
+  способны резолвить домены.
+
+### 12.5. Проверка после исправления
+
+```bash
+$ docker exec tg-ws-proxy python -c "import socket; \
+    print(socket.gethostbyname('github.com'))"            # 140.82.121.3
+$ docker exec tg-ws-proxy python -c "import socket; \
+    print(socket.gethostbyname('kws2.web.telegram.org'))" # 149.154.167.99
+$ timeout 6 bash -c 'echo > /dev/tcp/149.154.167.220/443' && echo OK  # OK
+```
+
+В логах — живые сессии с реальным трафиком:
+
+```
+08:29:33  INFO  [127.0.0.1:60348] DC2 media -> pool hit via 149.154.167.220
+08:29:50  INFO  [127.0.0.1:60360] DC2m WS session closed (normal): ^4.1KB (11 pkts) v840.7KB (27 pkts) in 16.8s
+```
+
+Ссылка после перехода на host-сеть:
+
+```
+tg://proxy?server=172.16.153.72&port=1443&secret=ddce6b517f89cd748635f70e0e052e79b9
+```
+
+### 12.6. Выводы по инциденту
+
+1. Публичные DNS (`8.8.8.8`, `1.1.1.1`, `77.88.8.8`) провайдер режет —
+   прописывать их в `--dns` бессмысленно, нужно использовать системный
+   резолвер или DNS провайдера.
+2. Блокировка Telegram по IP — ротационная. Стабильность обеспечивает
+   комбинация «рабочий DNS + fallback-механизмы», а не один прямой IP.
+3. Для сценария «домашняя машина + системd-resolved» host-сеть надёжнее
+   bridge-сети: нет проблем с DNS и пробросом портов.
+
+### 12.7. Инцидент на WiFi-сети: полная блокировка Telegram + интеграция CF Worker
+
+#### Симптомы
+
+После перехода на WiFi (`192.168.1.111` via `wlp12s0`) прокси снова не
+передавал трафик. Прямые соединения к DC2/DC4 не устанавливались, CF proxy
+падал с `TimeoutError()`:
+
+```
+06:41:50  WARNING  [127.0.0.1:39020] DC2 CF proxy failed: TimeoutError()
+06:41:50  WARNING  [127.0.0.1:58700] DC3 CF proxy failed: TimeoutError()
+```
+
+#### Диагностика WiFi-сети
+
+Проверка TCP 443 со всех подсетей Telegram показала **полную блокировку**:
+
+```bash
+$ for ip in 149.154.167.220 149.154.167.99 149.154.175.50 \
+            91.108.56.130 95.161.64.10 149.154.172.20; do
+    timeout 4 bash -c "echo > /dev/tcp/$ip/443" 2>/dev/null \
+      && echo "$ip:443 OK" || echo "$ip:443 FAIL"
+  done
+149.154.167.220:443  FAIL
+149.154.167.99:443   FAIL
+149.154.175.50:443   FAIL
+91.108.56.130:443    FAIL
+95.161.64.10:443     FAIL
+149.154.172.20:443   FAIL
+104.16.x:443         OK   # Cloudflare IP — доступен
+```
+
+Вывод: эта сеть режет Telegram жёстче, чем предыдущая (все подсети, не
+только DC2/DC4). CF-домены по-прежнему мертвы (нет A-записей через DoH).
+Единственный доступный путь — через Cloudflare, а он требует живых доменов
+или собственного Worker.
+
+#### Решение: интеграция Cloudflare Worker в Makefile
+
+Чтобы не зависеть от «однодневок», добавлена поддержка собственного
+Worker'а (см. `docs/CfWorker.md`):
+
+1. Создать аккаунт Cloudflare и задеплоить Worker с кодом из доки.
+2. Записать домен в `.cfworker`:
+
+   ```bash
+   echo 'random-symbols-1234.username.workers.dev' > .cfworker
+   ```
+
+3. `make restart` — Makefile подхватит файл и передаст
+   `-e TG_WS_PROXY_CF_WORKER="..."` в контейнер (Dockerfile уже умеет
+   принимать эту переменную через `--cfproxy-worker-domain`).
+
+Изменения в Makefile:
+
+```makefile
+CFWORKER  := $(shell cat .cfworker 2>/dev/null)
+
+run: .secret
+	docker run -d \
+		--name $(CONTAINER) \
+		--restart=always \
+		--network host \
+		-e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
+		$(if $(CFWORKER),-e TG_WS_PROXY_CF_WORKER="$(CFWORKER)",) \
+		$(IMAGE):latest
+```
+
+Новая команда `make cfworker` показывает текущий домен. Файл `.cfworker`
+добавлен в `.gitignore`.
+
+В логах после подключения должно появиться:
+
+```
+CF worker:     enabled (random-symbols-1234.username.workers.dev)
+```
+
+---
+
 ## Заключение
 
-После внедрения всех исправлений прокси работает стабильно:
+После внедрения всех исправлений (включая переход на host-сеть) прокси
+работает стабильно:
 
 - ✅ Контейнер запускается автоматически при загрузке ПК
 - ✅ Секрет фиксирован — Telegram не требует перенастройки
-- ✅ DNS работает через публичные серверы
-- ✅ WebSocket к Telegram — блокируется провайдером
+- ✅ DNS работает через системный резолвер (host-сеть), а не через
+  заблокированные провайдером публичные DNS
+- ✅ WebSocket к Telegram — блокируется провайдером ротационно, поэтому
+  работает fallback
 - ✅ Cloudflare Proxy fallback — успешно обходит блокировку
 - ✅ Telegram Desktop подключается и работает

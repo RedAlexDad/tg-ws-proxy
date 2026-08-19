@@ -10,12 +10,13 @@ CONTAINER := tg-ws-proxy
 PORT      := 1443
 DC_IPS    := "2:149.154.167.220 4:149.154.167.220"
 SECRET    := $(shell cat .secret 2>/dev/null)
+CFWORKER  := $(shell cat .cfworker 2>/dev/null)
 SERVICE   := tg-ws-proxy
 LINK_FILE := $(HOME)/.config/tg-ws-proxy/link
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build rebuild run stop rm restart logs secret link link-file shell install uninstall .secret
+.PHONY: help build rebuild run stop rm restart logs secret link link-file shell cfworker install uninstall .secret
 
 help:
 	@printf "$(BOLD)Usage:$(RESET)\n"
@@ -32,6 +33,7 @@ help:
 	@printf "  $(GREEN)link-file$(RESET)      Save link to $(LINK_FILE)\n"
 	@printf "  $(GREEN)secret$(RESET)         Show current secret\n"
 	@printf "  $(GREEN)shell$(RESET)          Open shell in running container\n"
+	@printf "  $(GREEN)cfworker$(RESET)       Show current CF Worker domain\n"
 	@printf "  $(GREEN)install$(RESET)        Install systemd service (auto-start on boot)\n"
 	@printf "  $(GREEN)uninstall$(RESET)      Remove systemd service\n\n"
 	@printf "$(BOLD)Docs:$(RESET)\n"
@@ -63,11 +65,9 @@ run: .secret
 	docker run -d \
 		--name $(CONTAINER) \
 		--restart=always \
-		-p $(PORT):$(PORT) \
-		--dns 8.8.8.8 \
-		--dns 77.88.8.8 \
-		--dns 1.1.1.1 \
+		--network host \
 		-e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
+		$(if $(CFWORKER),-e TG_WS_PROXY_CF_WORKER="$(CFWORKER)",) \
 		$(IMAGE):latest
 	@printf "$(GREEN)Container started on port $(PORT).$(RESET)\n"
 	@sleep 1
@@ -103,6 +103,9 @@ link-file:
 
 shell:
 	docker exec -it $(CONTAINER) /bin/sh
+
+cfworker:
+	@cat .cfworker 2>/dev/null || printf "$(RED)No .cfworker file.$(RESET) Create it: $(GREEN)echo 'your-domain.workers.dev' > .cfworker$(RESET)\n"
 
 install:
 	@printf "$(YELLOW)Installing systemd service '$(SERVICE)'...$(RESET)\n"
