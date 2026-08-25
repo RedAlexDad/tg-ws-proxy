@@ -22,11 +22,14 @@ if __name__ == '__main__' and (__package__ is None or __package__ == ''):
 
 from .utils import *
 from .stats import stats
-from .config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, coerce_domain_list
+from .config import (proxy_config, parse_dc_ip_list,
+                     start_cfproxy_domain_refresh, coerce_domain_list)
 from .bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
 from .raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
 from .fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
 from .balancer import balancer
+from .pool import cf_worker_pool
+from .autorecover import autorecover
 from .pool import ws_pool, cf_worker_pool
 from ._aes import Cipher, algorithms, modes
 
@@ -352,6 +355,7 @@ async def _handle_client(reader, writer, secret: bytes):
                                                 sni="sprinthost.ru")
             except Exception as exc:
                 stats.ws_errors += 1
+                autorecover.record('fronting')
                 log.warning("[%s] DC%d%s fronting failed: %s",
                             label, dc, media_tag, repr(exc))
             if ws:
@@ -373,6 +377,7 @@ async def _handle_client(reader, writer, secret: bytes):
                     break
                 except WsHandshakeError as exc:
                     stats.ws_errors += 1
+                    autorecover.record('ws')
                     if exc.is_redirect:
                         ws_failed_redirect = True
                         log.warning("[%s] DC%d%s got %d from %s -> %s",
@@ -386,12 +391,14 @@ async def _handle_client(reader, writer, secret: bytes):
                                     label, dc, media_tag, exc.status_line)
                 except asyncio.TimeoutError:
                     stats.ws_errors += 1
+                    autorecover.record('ws_timeout')
                     ws_timed_out = True
                     log.warning("[%s] DC%d%s WS connect timed out via %s",
                                 label, dc, media_tag, domain)
                     break
                 except Exception as exc:
                     stats.ws_errors += 1
+                    autorecover.record('ws')
                     all_redirects = False
                     log.warning("[%s] DC%d%s WS connect failed: %s",
                                 label, dc, media_tag, repr(exc))
@@ -408,6 +415,7 @@ async def _handle_client(reader, writer, secret: bytes):
                                                 sni="sprinthost.ru")
             except Exception as exc:
                 stats.ws_errors += 1
+                autorecover.record('fronting')
                 log.warning("[%s] DC%d%s fronting failed: %s",
                             label, dc, media_tag, repr(exc))
             if ws:
@@ -513,6 +521,26 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
         else:
             start_cfproxy_domain_refresh()
 
+    async def _soft_reset():
+        """In-place recovery: clear failure state and pools, refresh domains."""
+        log.warning("autorecover: soft reset: clearing blacklist/cooldowns/pools")
+        ws_blacklist.clear()
+        dc_fail_until.clear()
+        ip_fail_until.clear()
+        ws_pool.reset()
+        cf_worker_pool.reset()
+        balancer.update_domains_list(
+            proxy_config.cfproxy_user_domains or balancer.domains)
+        if proxy_config.fallback_cfproxy and not proxy_config.cfproxy_user_domains:
+            start_cfproxy_domain_refresh()
+
+    def _hard_reset():
+        """Last resort: exit the process so the container restarts."""
+        log.error("autorecover: hard reset: exiting process for container restart")
+        os._exit(1)
+
+    autorecover.configure(_soft_reset, _hard_reset)
+
     secret_bytes = bytes.fromhex(proxy_config.secret)
 
     def client_cb(r, w):
@@ -575,6 +603,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             raise
 
     log_stats_task = asyncio.create_task(log_stats())
+    autorecover_task = asyncio.create_task(autorecover.monitor())
 
     await ws_pool.warmup()
     await cf_worker_pool.warmup()
@@ -651,6 +680,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             await log_stats_task
         except asyncio.CancelledError:
             pass
+        await _quiet_cancel(autorecover_task)
         try:
             server.close()
             await server.wait_closed()

@@ -13,6 +13,7 @@ from .config import proxy_config
 from .raw_websocket import RawWebSocket
 from .pool import cf_worker_pool
 from ._aes import Cipher, algorithms, modes
+from .autorecover import autorecover
 
 
 log = logging.getLogger('tg-mtproto-proxy')
@@ -202,6 +203,7 @@ async def _cfproxy_worker_fallback(reader, writer, relay_init, label,
                 ws = await RawWebSocket.connect(worker_domain, worker_domain,
                                                 timeout=10.0, path=path)
             except Exception as exc:
+                autorecover.record('cf_worker')
                 log.warning("[%s] DC%d%s CF worker %s failed: %s",
                             label, dc, media_tag, worker_domain, repr(exc))
                 continue
@@ -233,6 +235,7 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
             chosen_domain = base_domain
             break
         except Exception as exc:
+            autorecover.record('cf')
             log.warning("[%s] DC%d%s CF proxy failed: %s",
                         label, dc, media_tag, repr(exc))
 
@@ -255,6 +258,7 @@ async def _tcp_fallback(reader, writer, dst, port, relay_init, label, ctx: Crypt
         rr, rw = await asyncio.wait_for(
             asyncio.open_connection(dst, port), timeout=10)
     except Exception as exc:
+        autorecover.record('tcp')
         log.warning("[%s] TCP fallback to %s:%d failed: %s",
                     label, dst, port, repr(exc))
         return False
