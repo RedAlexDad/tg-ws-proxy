@@ -29,7 +29,7 @@ class _WsPool:
         self._rotating: Dict[Tuple[int, bool], asyncio.Task] = {}
         self._refill_failures: Dict[Tuple[int, bool], int] = {}
         self._refill_after: Dict[Tuple[int, bool], float] = {}
-        self.try_fronting_first = False
+        self.try_fronting_first = False  # TODO: https://github.com/Flowseal/tg-ws-proxy/issues/1232
 
     async def get(self, dc: int, is_media: bool,
                   target_ip: str, domains: List[str],
