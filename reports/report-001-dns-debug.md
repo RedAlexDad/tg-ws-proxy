@@ -1274,19 +1274,45 @@ Worker'а (см. `docs/CfWorker.md`):
    `-e TG_WS_PROXY_CF_WORKER="..."` в контейнер (Dockerfile уже умеет
    принимать эту переменную через `--cfproxy-worker-domain`).
 
-Изменения в Makefile:
+#### Исправление: `--dns 127.0.0.53`
+
+После рестарта контейнера выяснилось, что DNS снова сломался — Docker
+с `--network host` перезаписывает `/etc/resolv.conf` в контейнере,
+подставляя `8.8.8.8`/`1.1.1.1` вместо системного `127.0.0.53`:
+
+```bash
+$ docker exec tg-ws-proxy cat /etc/resolv.conf
+nameserver 8.8.8.8      ← заблокирован провайдером!
+nameserver 1.1.1.1      ← заблокирован провайдером!
+
+$ docker exec tg-ws-proxy python -c "import socket; \
+    print(socket.gethostbyname('github.com'))"
+socket.gaierror: [Errno -3] Temporary failure in name resolution
+```
+
+Хост при этом резолвит нормально (`127.0.0.53` → systemd-resolved).
+
+Решение — явно указать Docker'у `--dns 127.0.0.53`, чтобы в контейнере
+использовался тот же резолвер, что и на хосте:
 
 ```makefile
-CFWORKER  := $(shell cat .cfworker 2>/dev/null)
+docker run -d \
+    --name $(CONTAINER) \
+    --restart=always \
+    --network host \
+    --dns 127.0.0.53 \
+    -e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
+    $(if $(CFWORKER),-e TG_WS_PROXY_CF_WORKER="$(CFWORKER)",) \
+    $(IMAGE):latest
+```
 
-run: .secret
-	docker run -d \
-		--name $(CONTAINER) \
-		--restart=always \
-		--network host \
-		-e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
-		$(if $(CFWORKER),-e TG_WS_PROXY_CF_WORKER="$(CFWORKER)",) \
-		$(IMAGE):latest
+После этого DNS работает стабильно:
+
+```bash
+$ docker exec tg-ws-proxy python -c "import socket; \
+    print(socket.gethostbyname('github.com'))"          # 140.82.121.4
+$ docker exec tg-ws-proxy python -c "import socket; \
+    print(socket.gethostbyname('kws2.pclead.co.uk'))"   # 172.67.155.165
 ```
 
 Новая команда `make cfworker` показывает текущий домен. Файл `.cfworker`

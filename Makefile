@@ -66,6 +66,7 @@ run: .secret
 		--name $(CONTAINER) \
 		--restart=always \
 		--network host \
+		--dns 127.0.0.53 \
 		-e TG_WS_PROXY_SECRET="$(shell cat .secret)" \
 		$(if $(CFWORKER),-e TG_WS_PROXY_CF_WORKER="$(CFWORKER)",) \
 		$(IMAGE):latest
