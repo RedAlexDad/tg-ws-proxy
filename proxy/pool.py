@@ -14,11 +14,14 @@ from .utils import ws_domains, DC_DEFAULT_IPS
 
 log = logging.getLogger('tg-mtproto-proxy')
 
+# TODO: domains handling is completely broken: wrong is_media flag causes tcp_reset,
+# but initial connection is still established no matter what is is_media flag is set to
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
     WS_POOL_CHECK_INTERVAL = 5.0
     REFILL_BACKOFF_INITIAL = 60.0
     REFILL_BACKOFF_MAX = 3600.0
+    # TODO: Lower refill backoff timer
     
     def __init__(self):
         self._idle: Dict[Tuple[int, bool], deque] = {}

@@ -339,6 +339,10 @@ async def _handle_client(reader, writer, secret: bytes):
         ws_timed_out = False
         all_redirects = True
 
+        # TODO: Sometimes connection is established, and sometimes its timed out
+        # So we don't need to fully restrict pool refill, let it try connecting
+        # in the background. May be remove direct connection there completely and
+        # only use pool for them? But need to fix domains handling first
         allow_pool_refill = now >= ip_fail_until.get(target, 0)
         ws = await ws_pool.get(
             dc, is_media, target, domains,
