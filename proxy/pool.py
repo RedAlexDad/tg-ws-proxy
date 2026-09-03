@@ -149,6 +149,8 @@ class _WsPool:
                     log.debug(
                         "WS pool rotated DC%d%s: %d stale, %d ready",
                         dc, 'm' if is_media else '', len(expired), len(bucket))
+
+                if len(bucket) < proxy_config.pool_size:
                     self._schedule_refill(key, target_ip, domains)
         finally:
             if self._rotating.get(key) is asyncio.current_task():
