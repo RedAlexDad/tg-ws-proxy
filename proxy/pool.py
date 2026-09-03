@@ -14,7 +14,7 @@ from .utils import ws_domains, DC_DEFAULT_IPS
 
 log = logging.getLogger('tg-mtproto-proxy')
 
-# TODO: domains handling is completely broken: wrong is_media flag causes tcp_reset,
+# TODO: domains handling is broken: wrong is_media flag causes tcp_reset after handshake,
 # but initial connection is still established no matter what is is_media flag is set to
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
