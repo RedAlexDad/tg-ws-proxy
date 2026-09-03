@@ -28,7 +28,7 @@ class _WsPool:
         self._rotating: Dict[Tuple[int, bool], asyncio.Task] = {}
         self._refill_failures: Dict[Tuple[int, bool], int] = {}
         self._refill_after: Dict[Tuple[int, bool], float] = {}
-        self.try_fronting_first = False  # TODO: https://github.com/Flowseal/tg-ws-proxy/issues/1232
+        self.try_fronting_first = True
 
     async def get(self, dc: int, is_media: bool,
                   target_ip: str, domains: List[str]
@@ -167,7 +167,7 @@ class _WsPool:
                     target_ip, domain, timeout=8)
                 self.try_fronting_first = False
                 return ws
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ConnectionResetError):
                 if self.try_fronting_first:
                     return None
                 return await self._connect_fronted(target_ip, domain)
