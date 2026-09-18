@@ -11,6 +11,7 @@ from .raw_websocket import RawWebSocket, WsHandshakeError
 from .stats import stats
 from .config import proxy_config
 from .utils import ws_domains, DC_DEFAULT_IPS
+from .autorecover import autorecover
 
 log = logging.getLogger('tg-mtproto-proxy')
 
@@ -184,6 +185,7 @@ class _WsPool:
             ws = await RawWebSocket.connect(
                 target_ip, domain, timeout=7, sni="sprinthost.ru")
         except Exception:
+            autorecover.record('fronting')
             return None
 
         stats.connections_fronting += 1
