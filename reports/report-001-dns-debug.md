@@ -1326,6 +1326,115 @@ CF worker:     enabled (random-symbols-1234.username.workers.dev)
 
 ---
 
+## 13. Обновление ядра прокси из upstream (cherry-pick)
+
+### 13.1. Предпосылки
+
+Форк `RedAlexDad/tg-ws-proxy` отстал от исходного `Flowseal/tg-ws-proxy`
+на 49 коммитов. Точка расхождения — `4f9edf3 Version bump`
+(27.06.2026). Пока форк жил своей жизнью (Docker, host-сеть, CF Worker),
+в upstream развивалось именно ядро прокси: пул WS-соединений, фронтинг,
+ротации, работа с CF-доменами.
+
+Отделить нужное от ненужного оказалось просто: upstream — это десктопное
+GUI-приложение (customtkinter, pystray, pyinstaller, tray, локали), а
+папка `proxy/` **самодостаточна** — не импортирует `ui/` и `utils/`:
+
+```bash
+$ git grep -nE "^(from|import) (utils|ui)" upstream/main -- proxy/
+(пусто)
+```
+
+Поэтому переносилось только содержимое `proxy/`, без GUI.
+
+### 13.2. Хронология черри-пика
+
+Перенесено 25 upstream-коммитов, затрагивающих `proxy/`. Ключевые:
+
+| Коммит | Что |
+|---|---|
+| `88b7b55` | fronting refactoring: implemented into ws_pool |
+| `34cfd8c` | pool fronting |
+| `8ac52f6` | auto wspool rotation |
+| `a0545cc` | don't retry fronting connect |
+| `47b8db1` | pool refill backoff |
+| `41e97c6` | hard limit workers pool |
+| `aee473c` | CF Worker pool refactoring |
+| `5eb7e00` | try ws_pool if connection is timed out |
+| `e8ad0d6` | refill pool after rotating expired connections |
+| `c02398f` | censoring domains |
+| `c3309ed` | поддержка тестовых DC |
+
+Команда переноса (только `proxy/`, с 3-way merge):
+
+```bash
+for c in <список коммитов>; do
+    git diff "$c^" "$c" -- proxy/ \
+        | git apply --3way --index --whitespace=nowarn
+    git commit -C "$c"
+done
+```
+
+Два конфликта (`88b7b55`, `aee473c`) разрешены в пользу upstream: код
+переехал (`fronting` из `tg_ws_proxy.py` в `pool.py`, рефакторинг CF-пула),
+а «мои» стороны конфликта — это старые хуки `autorecover`, которые
+перевешиваются отдельно.
+
+### 13.3. Возврат autorecover
+
+Автовосстановление перевешено на новое ядро:
+
+- `autorecover.record()` — в WS-цикл, CF worker, CF proxy, TCP fallback;
+- счётчик `fronting` перенесён в `pool._connect_fronted()`;
+- монитор `autorecover.monitor()` и `soft`/`hard` reset снова
+  подключаются в `_run()`.
+
+### 13.4. Новая зависимость
+
+Ядро upstream использует `certifi` в `utils.build_github_opener()`.
+Без него контейнер падал:
+
+```
+ModuleNotFoundError: No module named 'certifi'
+```
+
+Dockerfile дополнен:
+
+```dockerfile
+RUN "$VIRTUAL_ENV/bin/pip" install cryptography==46.0.5 certifi
+```
+
+### 13.5. Проверка
+
+После пересборки образа и `make restart`:
+
+```
+stats: total=6 active=2 ws=5 cf=1 front=10 pool=4/6 up=7.9KB down=46.1KB err=1
+```
+
+Ошибок и трейсбеков — нет. Работают пул (`pool=4/6`), фронтинг
+(`front=10`) и CF proxy (`cf=1`). В логах видна новая логика upstream:
+
+```
+DC2 WS connect to 149.154.167.220 was timed out, but pool hit -> using WS
+```
+
+Итог изменения относительно состояния до обновления (без моих файлов):
+
+```
+Dockerfile             |   2 +-
+proxy/__init__.py      |   2 +-
+proxy/bridge.py        |  63 +++++++------
+proxy/config.py        |   5 +-
+proxy/pool.py          | 248 ++++++++++++++++++++++++-----------
+proxy/raw_websocket.py |  31 +++++--
+proxy/tg_ws_proxy.py   | 150 +++++++++++++-------------
+proxy/utils.py         |  51 +++++++++-
+8 files changed, 367 insertions(+), 185 deletions(-)
+```
+
+---
+
 ## Заключение
 
 После внедрения всех исправлений (включая переход на host-сеть) прокси
@@ -1338,4 +1447,7 @@ CF worker:     enabled (random-symbols-1234.username.workers.dev)
 - ✅ WebSocket к Telegram — блокируется провайдером ротационно, поэтому
   работает fallback
 - ✅ Cloudflare Proxy fallback — успешно обходит блокировку
+- ✅ Ядро обновлено из upstream (25 коммитов): pool fronting, авто-ротация
+  пула, refill backoff, лимит worker-пула, выбор ws_pool при таймауте
+- ✅ Автовосстановление (`autorecover`) перевешено на новое ядро
 - ✅ Telegram Desktop подключается и работает
